@@ -13,6 +13,9 @@ swiftc -O -swift-version 5 \
     -o "$APP/Contents/MacOS/Fireplace"
 
 cp Info.plist "$APP/Contents/Info.plist"
+# Regenerate with: build/Fireplace.app/Contents/MacOS/Fireplace --make-icon AppIcon.iconset
+#                  iconutil -c icns AppIcon.iconset -o Resources/AppIcon.icns
+cp Resources/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 # Ad-hoc signature so macOS can remember the microphone permission.
 codesign --force --sign - "$APP"
 

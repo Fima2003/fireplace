@@ -96,8 +96,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
 // Developer commands, handy for tuning without touching the desktop:
 //   Fireplace --analyze recording.wav   print the claps found in an audio file
-//   Fireplace --render out.png          write the wallpaper art (2880x1800)
+//   Fireplace --render out.png          write a still of a fresh fire (2880x1800)
 //   Fireplace --preview                 show the live fire in a normal window (quits nothing)
+//   Fireplace --make-icon AppIcon.iconset   render the app icon
 func runCommandLine(_ args: [String]) -> Int32? {
     if let i = args.firstIndex(of: "--analyze"), i + 1 < args.count {
         do {
@@ -122,9 +123,22 @@ func runCommandLine(_ args: [String]) -> Int32? {
         }
     }
     if let i = args.firstIndex(of: "--render"), i + 1 < args.count {
-        guard let image = FireplaceArt.render(size: CGSize(width: 2880, height: 1800), flames: !args.contains("--no-flames")),
-              (try? FireplaceArt.writePNG(image, to: URL(fileURLWithPath: args[i + 1]))) != nil else { return 1 }
+        let seed = FireSeed()
+        print(String(format: "seed %016llx", seed.raw))
+        let seconds = args.firstIndex(of: "--seconds").flatMap { Double(args[$0 + 1]) } ?? 4
+        guard let renderer = FireRenderer(layoutAspect: 1.6, seed: seed),
+              let image = renderer.renderImage(width: 2880, height: 1800, warmUp: seconds),
+              (try? writePNG(image, to: URL(fileURLWithPath: args[i + 1]))) != nil else { return 1 }
         return 0
+    }
+    if let i = args.firstIndex(of: "--make-icon"), i + 1 < args.count {
+        do {
+            try AppIcon.writeIconset(to: URL(fileURLWithPath: args[i + 1]))
+            return 0
+        } catch {
+            print("Could not make icon: \(error)")
+            return 1
+        }
     }
     return nil
 }
@@ -136,8 +150,7 @@ if CommandLine.arguments.contains("--preview") {
     let window = NSWindow(contentRect: NSRect(x: 100, y: 100, width: 1200, height: 750),
                           styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
     window.title = "Fireplace Preview"
-    window.contentView = FireplaceView(frame: NSRect(x: 0, y: 0, width: 1200, height: 750),
-                                       scale: window.backingScaleFactor)
+    window.contentView = FireplaceView(frame: NSRect(x: 0, y: 0, width: 1200, height: 750), seed: FireSeed())
     window.makeKeyAndOrderFront(nil)
     app.setActivationPolicy(.regular)
     app.activate(ignoringOtherApps: true)

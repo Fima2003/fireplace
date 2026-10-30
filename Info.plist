@@ -8,6 +8,8 @@
 	<string>Fireplace</string>
 	<key>CFBundleDisplayName</key>
 	<string>Fireplace</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
 	<key>CFBundleExecutable</key>
 	<string>Fireplace</string>
 	<key>CFBundlePackageType</key>

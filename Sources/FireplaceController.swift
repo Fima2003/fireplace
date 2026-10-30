@@ -5,6 +5,7 @@ import AppKit
 final class FireplaceController {
     private(set) var isLit = false
     private var windows: [NSWindow] = []
+    private var occlusionObservers: [NSObjectProtocol] = []
     private var savedWallpapers: [CGDirectDisplayID: (url: URL, options: [NSWorkspace.DesktopImageOptionKey: Any])] = [:]
 
     private let supportDir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -15,8 +16,11 @@ final class FireplaceController {
     func light() {
         guard !isLit else { return }
         isLit = true
-        setFireplaceWallpaper()
-        showWindows()
+        // One hardware-random seed per fire, shared by the wallpaper and the live view.
+        let seed = FireSeed()
+        log(String(format: "Lighting fire %016llx", seed.raw))
+        setFireplaceWallpaper(seed: seed)
+        showWindows(seed: seed)
         quitOtherApps()
     }
 
@@ -28,6 +32,8 @@ final class FireplaceController {
         }, completionHandler: { [self] in
             windows.forEach { $0.orderOut(nil) }
             windows = []
+            occlusionObservers.forEach { NotificationCenter.default.removeObserver($0) }
+            occlusionObservers = []
             restoreWallpaper()
             isLit = false
             completion()
@@ -36,8 +42,13 @@ final class FireplaceController {
 
     // MARK: - Wallpaper
 
-    private func setFireplaceWallpaper() {
+    private func setFireplaceWallpaper(seed: FireSeed) {
         try? FileManager.default.createDirectory(at: supportDir, withIntermediateDirectories: true)
+        // Each fire is unique, so clear out stills from earlier ones.
+        for old in (try? FileManager.default.contentsOfDirectory(at: supportDir, includingPropertiesForKeys: nil)) ?? []
+        where old.lastPathComponent.hasPrefix("fireplace-") {
+            try? FileManager.default.removeItem(at: old)
+        }
         let workspace = NSWorkspace.shared
         for screen in NSScreen.screens {
             guard let id = screen.displayID else { continue }
@@ -46,12 +57,11 @@ final class FireplaceController {
             }
             let size = CGSize(width: screen.frame.width * screen.backingScaleFactor,
                               height: screen.frame.height * screen.backingScaleFactor)
-            let file = supportDir.appendingPathComponent("fireplace-\(Int(size.width))x\(Int(size.height)).png")
+            let file = supportDir.appendingPathComponent(String(format: "fireplace-%016llx-%dx%d.png", seed.raw, Int(size.width), Int(size.height)))
             do {
-                if !FileManager.default.fileExists(atPath: file.path) {
-                    guard let image = FireplaceArt.render(size: size, flames: true) else { continue }
-                    try FireplaceArt.writePNG(image, to: file)
-                }
+                guard let renderer = FireRenderer(layoutAspect: Float(size.width / size.height), seed: seed),
+                      let image = renderer.renderImage(width: Int(size.width), height: Int(size.height)) else { continue }
+                try writePNG(image, to: file)
                 try workspace.setDesktopImageURL(file, for: screen, options: [
                     .imageScaling: NSImageScaling.scaleProportionallyUpOrDown.rawValue,
                     .allowClipping: true,
@@ -87,8 +97,12 @@ final class FireplaceController {
 
     // MARK: - Live fire
 
-    private func showWindows() {
+    private func showWindows(seed: FireSeed) {
         for screen in NSScreen.screens {
+            guard let view = FireplaceView(frame: NSRect(origin: .zero, size: screen.frame.size), seed: seed) else {
+                log("Metal is unavailable; showing the still wallpaper only.")
+                continue
+            }
             let window = NSWindow(contentRect: screen.frame, styleMask: .borderless, backing: .buffered, defer: false)
             window.setFrame(screen.frame, display: false)
             // Desktop level: above the wallpaper, below desktop icons and every app window.
@@ -99,8 +113,14 @@ final class FireplaceController {
             window.hasShadow = false
             window.backgroundColor = .black
             window.isReleasedWhenClosed = false
-            window.contentView = FireplaceView(frame: NSRect(origin: .zero, size: screen.frame.size),
-                                               scale: screen.backingScaleFactor)
+            window.contentView = view
+            // Only simulate while the fire can actually be seen.
+            occlusionObservers.append(NotificationCenter.default.addObserver(
+                forName: NSWindow.didChangeOcclusionStateNotification, object: window, queue: .main
+            ) { [weak window, weak view] _ in
+                guard let window, let view else { return }
+                view.isPaused = !window.occlusionState.contains(.visible)
+            })
             window.alphaValue = 0
             window.orderFront(nil)
             windows.append(window)
