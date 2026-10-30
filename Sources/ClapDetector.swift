@@ -169,6 +169,13 @@ final class ClapDetector {
     private let settings: ClapSettings
     private let engine = AVAudioEngine()
     private var configObserver: NSObjectProtocol?
+    private var ignoreUntil = Date.distantPast
+
+    /// Ignores claps for a while, e.g. while our own crackling sound is playing:
+    /// a crackle through the speakers looks just like a clap to the microphone.
+    func ignore(for seconds: TimeInterval) {
+        ignoreUntil = max(ignoreUntil, Date().addingTimeInterval(seconds))
+    }
 
     init(settings: ClapSettings = .fromDefaults()) {
         self.settings = settings
@@ -211,6 +218,7 @@ final class ClapDetector {
     }
 
     private func deliver(_ event: ClapAnalyzer.Event) {
+        guard Date() >= ignoreUntil else { return }
         switch event {
         case let .clap(_, level, _): onClap?(level)
         case .doubleClap: onDoubleClap?()

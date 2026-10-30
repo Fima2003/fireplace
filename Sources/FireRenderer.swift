@@ -25,6 +25,8 @@ private struct SimUniforms {
     var frame: Float
     var layoutAspect: Float
     var sparkCount = Float(FireSimulation.sparkCount)
+    var burst: Float = 0
+    var pad: Float = 0
 }
 
 private struct Spark {
@@ -51,7 +53,7 @@ enum FireGPU {
 final class FireSimulation {
     static let dt = 1.0 / 60
     static let pressureIterations = 30
-    static let sparkCount = 48
+    static let sparkCount = 384
 
     let size: SIMD2<Int>
     private let seed: FireSeed
@@ -65,6 +67,10 @@ final class FireSimulation {
     private var simTime: Double = 0
     private var frame: Float = 0
     private var needsClear = true
+    private var stokedAt: Double = -.infinity
+
+    /// A sudden flare-up with a shower of sparks, fading over a couple of seconds.
+    func stoke() { stokedAt = simTime }
 
     init?(device: MTLDevice, library: MTLLibrary, seed: FireSeed, layoutAspect: Float) {
         self.seed = seed
@@ -131,7 +137,8 @@ final class FireSimulation {
             frame += 1
             var u = SimUniforms(size: [Float(size.x), Float(size.y)], dt: Float(Self.dt),
                                 time: Float(simTime.truncatingRemainder(dividingBy: 4000)),
-                                seed: seed.shaderSeed, frame: frame, layoutAspect: layoutAspect)
+                                seed: seed.shaderSeed, frame: frame, layoutAspect: layoutAspect,
+                                burst: Float(exp(-max(0, simTime - stokedAt) / 0.8)))
             enc.setBytes(&u, length: MemoryLayout<SimUniforms>.stride, index: 0)
             enc.setBuffer(logs, offset: 0, index: 1)
 
@@ -276,12 +283,14 @@ final class FireRenderer {
     }
 
     /// Lets the fire burn for `warmUp` seconds of simulated time, then captures a still.
-    func renderImage(width: Int, height: Int, warmUp: Double = 4) -> CGImage? {
+    func renderImage(width: Int, height: Int, warmUp: Double = 4, stokeAt: Double? = nil) -> CGImage? {
         let steps = Int(warmUp / FireSimulation.dt)
+        let stokeStep = stokeAt.map { Int($0 / FireSimulation.dt) } ?? -1
         var done = 0
         while done < steps {
             guard let cb = queue.makeCommandBuffer() else { return nil }
-            let n = min(60, steps - done)
+            if done == stokeStep { simulation.stoke() }
+            let n = min(60, steps - done, done < stokeStep ? stokeStep - done : .max)
             simulation.step(count: n, commandBuffer: cb)
             cb.commit()
             done += n

@@ -42,6 +42,8 @@ struct SimUniforms {
     float frame;
     float layoutAspect;
     float sparkCount;
+    float burst;   // 1 right after the fire is stoked, decaying to 0
+    float pad;
 };
 
 struct Spark {
@@ -584,7 +586,8 @@ kernel void react(texture2d<float, access::read> stateIn [[texture(0)]],
     float t = fmod(s.time, 4000.0);
     float spots = smoothstep(0.35, 0.75, noise3(float3(p * 65.0 + s.seed, t * 1.6)));
     float surge = 0.45 + noise3(float3(p * 8.0 + s.seed * 1.7, t * 0.35));
-    float release = source * spots * surge;
+    // Stoking the fire stirs up the wood: it outgasses much harder for a moment.
+    float release = source * spots * surge * (1.0 + 2.5 * s.burst);
     fuel += s.dt * 6.0 * release;
     T = max(T, source * 0.6);                    // the glowing wood ignites its own gas
 
@@ -714,15 +717,16 @@ kernel void updateSparks(device Spark* sparks [[buffer(0)]], constant SimUniform
     Layout L = makeLayout(s.layoutAspect);
     if (sp.life <= 0.0) {
         float2 h = float2(float(id) * 1.37 + s.seed, s.frame);
-        if (hash12(h) < 0.0015) {
+        if (hash12(h) < 0.0015 + 0.06 * s.burst * s.burst) {
             LogParams lg = logs[min(2, int(hash12(h + 3.1) * 3.0))];
             float along = (hash12(h + 5.7) - 0.5) * 1.6 * lg.halfLen * L.fw;
             float2 c = float2(lg.center.x * L.fw, L.fy0 + lg.center.y);
             float cs = cos(lg.angle), sn = sin(lg.angle);
             float2 onTop = c + float2(along * cs - lg.radius * sn, along * sn + lg.radius * cs);
             sp.pos = sceneToSim(onTop, s.size, L);
-            sp.vel = float2((hash12(h + 7.3) - 0.5) * 80.0, 60.0 + hash12(h + 8.9) * 160.0);
-            sp.heat = 0.7 + 0.5 * hash12(h + 9.4);
+            float kick = 1.0 + 2.2 * s.burst;
+            sp.vel = float2((hash12(h + 7.3) - 0.5) * 80.0 * kick, (60.0 + hash12(h + 8.9) * 160.0) * kick);
+            sp.heat = 0.7 + 0.5 * hash12(h + 9.4) + 0.4 * s.burst;
             sp.life = 1.0 + 2.5 * hash12(h + 11.2);
         }
     } else {
@@ -815,6 +819,7 @@ struct SparkOut {
     float4 position [[position]];
     float size [[point_size]];
     float heat;
+    float twinkle;
 };
 
 vertex SparkOut sparkVertex(uint vid [[vertex_id]], const device Spark* sparks [[buffer(0)]],
@@ -825,8 +830,11 @@ vertex SparkOut sparkVertex(uint vid [[vertex_id]], const device Spark* sparks [
     SparkOut o;
     o.position = sp.life > 0.0 ? float4(2.0 * (p - u.viewCenter) * u.resolution.y / (u.viewScale * u.resolution), 0.0, 1.0)
                                : float4(-10.0, -10.0, 0.0, 1.0);
-    o.size = sp.life > 0.0 ? max(2.0, 0.004 * u.resolution.y / u.viewScale) : 0.0;
+    // Fresh, hot sparks are bigger; they shrink as they cool.
+    o.size = sp.life > 0.0 ? max(2.0, (0.003 + 0.004 * saturate(sp.heat)) * u.resolution.y / u.viewScale) : 0.0;
     o.heat = sp.heat;
+    // Burning sparks tumble, so their brightness flickers frame to frame.
+    o.twinkle = 0.45 + 1.1 * hash12(float2(float(vid) * 7.13, floor(u.time * 24.0)));
     return o;
 }
 
@@ -834,6 +842,7 @@ fragment float4 sparkFragment(SparkOut in [[stage_in]], float2 pc [[point_coord]
     float d = length(pc - 0.5) * 2.0;
     float glow = exp(-d * d * 7.0);
     float k = 900.0 + 900.0 * saturate(in.heat);
-    return float4(blackbody(k) * glow * (0.5 + 1.8 * in.heat * in.heat), 0.0);
+    float core = exp(-d * d * 30.0);   // white-hot centre
+    return float4((blackbody(k) * glow * (0.5 + 1.8 * in.heat * in.heat) + core * saturate(in.heat - 0.6)) * in.twinkle, 0.0);
 }
 """#

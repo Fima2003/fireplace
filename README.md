@@ -7,7 +7,8 @@ A menu bar app for macOS that listens to the microphone for a double clap.
 ![A fire burning in the fireplace](docs/screenshot.png)
 
 - **First double clap:** your desktop becomes a fireplace with a live, physically simulated fire, and every other app quits.
-- **Second double clap:** the fire fades out, your original wallpaper comes back, and Fireplace quits.
+- **Every double clap after that:** you stoke the fire. It flares up with a shower of sparks and a few seconds of whoosh, roar and crackle.
+- **To put it out:** choose **Put Out the Fire and Quit** in the menu bar. The fire fades, your original wallpaper comes back, and Fireplace quits.
 
 ## Build and run
 
@@ -27,6 +28,8 @@ The flames aren't an animation. They're a 2D fluid simulation that runs on the G
 - **Flow:** incompressible air with semi-Lagrangian advection, a Jacobi pressure solve, Boussinesq buoyancy (hot gas rises) and vorticity confinement (keeps the swirls). Room air comes in through the mouth of the fireplace and leaves up the chimney throat.
 - **Combustion:** hot logs give off fuel gas in wandering hot spots. Above its ignition temperature the gas burns, releasing heat and soot. Everything cools by mixing and by T⁴ radiation.
 - **Light:** only hot soot glows, as a black body: its color and Stefan–Boltzmann brightness come from its temperature. The room is lit by the fire's total heat, so the bricks brighten and dim with the flames. Sparks are particles carried by the airflow.
+
+The stoking sound is synthesized on the fly, not played from a file: filtered noise for the whoosh, roar and hiss, plus randomly timed crackle and pop voices that thin out as the fire settles. Crackles through your speakers look just like claps to the microphone, so the app ignores claps while the sound plays.
 
 The rest of the scene is drawn once per screen size: bump-mapped brick, charred logs with glowing cracks, the coal bed, the mantel, the floor.
 
@@ -51,6 +54,7 @@ Developer commands:
 ```bash
 build/Fireplace.app/Contents/MacOS/Fireplace --preview            # live fire in a normal window; quits nothing
 build/Fireplace.app/Contents/MacOS/Fireplace --analyze clip.wav   # list the claps found in a recording
-build/Fireplace.app/Contents/MacOS/Fireplace --render out.png     # a still of a fresh fire (--seconds N to let it burn longer)
+build/Fireplace.app/Contents/MacOS/Fireplace --render out.png     # a still of a fresh fire (--seconds N to burn longer, --stoke to catch a flare-up)
+build/Fireplace.app/Contents/MacOS/Fireplace --sound out.wav      # write the stoking sound to a file
 build/Fireplace.app/Contents/MacOS/Fireplace --make-icon AppIcon.iconset   # render a new app icon
 ```

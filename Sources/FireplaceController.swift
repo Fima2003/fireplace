@@ -24,6 +24,11 @@ final class FireplaceController {
         quitOtherApps()
     }
 
+    /// Flares the fire up with a shower of sparks on every screen.
+    func stoke() {
+        for window in windows { (window.contentView as? FireplaceView)?.stoke() }
+    }
+
     func putOut(completion: @escaping () -> Void) {
         guard isLit else { return completion() }
         NSAnimationContext.runAnimationGroup({ ctx in

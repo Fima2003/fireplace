@@ -28,4 +28,6 @@ final class FireplaceView: MTKView, MTKViewDelegate {
     }
 
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
+
+    func stoke() { renderer.simulation.stoke() }
 }
