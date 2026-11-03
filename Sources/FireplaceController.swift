@@ -1,10 +1,13 @@
 import AppKit
 
-/// Lights the fireplace (wallpaper + live desktop-level window + quitting other
-/// apps) and puts it out again, restoring the original wallpaper.
+/// Lights the fireplace (wallpaper + live desktop-level window + sound + the coil
+/// button + quitting other apps) and puts it out again, restoring the original wallpaper.
 final class FireplaceController {
     private(set) var isLit = false
     private var windows: [NSWindow] = []
+    private var coil: CoilPanel?
+    /// Plays for as long as the fire burns; its engine belongs to the clap detector.
+    private let sound: FireSound
     private var occlusionObservers: [NSObjectProtocol] = []
     private var savedWallpapers: [CGDirectDisplayID: (url: URL, options: [NSWorkspace.DesktopImageOptionKey: Any])] = [:]
 
@@ -12,6 +15,10 @@ final class FireplaceController {
         .appendingPathComponent("Fireplace", isDirectory: true)
     /// Written while lit so a crash or force-quit doesn't leave the wallpaper changed.
     private var recoveryFile: URL { supportDir.appendingPathComponent("original-wallpapers.json") }
+
+    init(sound: FireSound) {
+        self.sound = sound
+    }
 
     func light() {
         guard !isLit else { return }
@@ -21,6 +28,9 @@ final class FireplaceController {
         log(String(format: "Lighting fire %016llx", seed.raw))
         setFireplaceWallpaper(seed: seed)
         showWindows(seed: seed)
+        showCoil()
+        // The ramp runs from the sound's first rendered sample, i.e. once its engine is up.
+        sound.fadeIn(over: 2)
         quitOtherApps()
     }
 
@@ -29,16 +39,30 @@ final class FireplaceController {
         for window in windows { (window.contentView as? FireplaceView)?.stoke() }
     }
 
+    /// Drives the fire harder (0 to 1) for as long as the coil is held against it.
+    func setBoost(_ boost: Float) {
+        for window in windows { (window.contentView as? FireplaceView)?.setBoost(boost) }
+    }
+
+    /// Presses the coil into the fire for a moment, as the menu item does.
+    func pressCoil(for seconds: Double = 1.5) { coil?.press(for: seconds) }
+
+    /// Fades the fire, its sound and the coil out together, then restores the wallpaper.
     func putOut(completion: @escaping () -> Void) {
         guard isLit else { return completion() }
+        coil?.tearDown()
+        sound.fadeOut(over: 0.8)
         NSAnimationContext.runAnimationGroup({ ctx in
             ctx.duration = 0.8
             for window in windows { window.animator().alphaValue = 0 }
+            coil?.animator().alphaValue = 0
         }, completionHandler: { [self] in
             windows.forEach { $0.orderOut(nil) }
             windows = []
             occlusionObservers.forEach { NotificationCenter.default.removeObserver($0) }
             occlusionObservers = []
+            coil?.orderOut(nil)
+            coil = nil
             restoreWallpaper()
             isLit = false
             completion()
@@ -134,6 +158,29 @@ final class FireplaceController {
             ctx.duration = 1.5
             for window in windows { window.animator().alphaValue = 1 }
         }
+    }
+
+    // MARK: - The coil
+
+    private func showCoil() {
+        let panel = CoilPanel()
+        panel.onPress = { [weak self] in
+            self?.stoke()
+            self?.sound.stoke()
+        }
+        panel.onHeat = { [weak self] heat in
+            self?.setBoost(heat)
+            self?.sound.intensity = heat
+        }
+        panel.placeInCorner()
+        panel.alphaValue = 0
+        panel.orderFront(nil)
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 1.5
+            panel.animator().alphaValue = 1
+        }
+        coil = panel
+        log("Coil button shown at \(NSStringFromRect(panel.frame))")
     }
 
     // MARK: - Other apps

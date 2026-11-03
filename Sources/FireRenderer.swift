@@ -13,7 +13,9 @@ struct FireUniforms {
     var layoutAspect: Float
     var seed: Float
     var simSize: SIMD2<Float>
-    var pad: SIMD2<Float> = .zero
+    /// Brightness of the flame's glow relative to the room.
+    var exposure: Float = 5.5
+    var pad1: Float = 0
 }
 
 /// Matches `SimUniforms` in the shader.
@@ -26,7 +28,8 @@ private struct SimUniforms {
     var layoutAspect: Float
     var sparkCount = Float(FireSimulation.sparkCount)
     var burst: Float = 0
-    var pad: Float = 0
+    var boost: Float = 0
+    var sparkBurst: Float = 0
 }
 
 private struct Spark {
@@ -35,6 +38,18 @@ private struct Spark {
     var heat: Float = 0
     var life: Float = 0
     var pad: SIMD2<Float> = .zero
+}
+
+/// Matches `BlurParams` in the shader.
+private struct BlurParams {
+    var dir: SIMD2<Float>
+    var targetSize: SIMD2<Float>
+}
+
+/// Matches `FireLight` in the shader: how much light each part of the fire gives off.
+private struct FireLight {
+    var bands: SIMD4<Float> = .zero
+    var smooth: SIMD4<Float> = .zero
 }
 
 /// Shared Metal device and the compiled shader library.
@@ -52,14 +67,17 @@ enum FireGPU {
 /// The fire's physics: a fluid simulation over the firebox, stepped on the GPU.
 final class FireSimulation {
     static let dt = 1.0 / 60
-    static let pressureIterations = 30
+    static let pressureIterations = 36
     static let sparkCount = 384
 
     let size: SIMD2<Int>
     private let seed: FireSeed
     private let layoutAspect: Float
-    private var velocity, velocityTmp, state, stateTmp, curl, divergence, pressure, pressureTmp: MTLTexture
-    /// Latest state with a mip chain; the top mip is the fire's mean temperature.
+    /// Swapped in pairs every sub-step, so only valid to read between calls to `step`.
+    private(set) var velocity, velocityTmp, state, stateTmp, curl, divergence, pressure, pressureTmp: MTLTexture
+    /// Forward and back-traced copies for the MacCormack advection.
+    private var velFwd, velBack, stateFwd, stateBack: MTLTexture
+    /// Latest state with a mip chain; the renderer taps the coarse levels for the room light.
     let display: MTLTexture
     let sparks: MTLBuffer
     let logs: MTLBuffer
@@ -72,13 +90,18 @@ final class FireSimulation {
     /// A sudden flare-up with a shower of sparks, fading over a couple of seconds.
     func stoke() { stokedAt = simTime }
 
+    /// How hard the fire is being driven right now, 0 (left alone) to 1 (the coil
+    /// pressed into the coals): more fuel, hotter wood, more sparks, for as long as it's held.
+    var boost: Float = 0
+
     init?(device: MTLDevice, library: MTLLibrary, seed: FireSeed, layoutAspect: Float) {
         self.seed = seed
         self.layoutAspect = layoutAspect
         // Square cells across the firebox mouth, matching makeLayout() in the shader.
+        // The shader's per-cell constants are written for 256 across and rescaled from s.size.
         let fw = 0.56 * min(0.62 * layoutAspect, 1.05)
         let domainHeight: Float = 0.372 * 1.08 + 0.01
-        let nx = 256
+        let nx = 384
         let size = SIMD2<Int>(nx, Int((Float(nx) * domainHeight / fw).rounded(.up)))
         self.size = size
 
@@ -92,9 +115,12 @@ final class FireSimulation {
               let s0 = texture(.rgba16Float), let s1 = texture(.rgba16Float),
               let c = texture(.r16Float), let dv = texture(.r32Float),
               let p0 = texture(.r32Float), let p1 = texture(.r32Float),
-              let disp = texture(.rgba16Float, mipmapped: true)
+              let disp = texture(.rgba16Float, mipmapped: true),
+              let vf = texture(.rg16Float), let vb = texture(.rg16Float),
+              let sf = texture(.rgba16Float), let sb = texture(.rgba16Float)
         else { return nil }
         (velocity, velocityTmp, state, stateTmp, curl, divergence, pressure, pressureTmp, display) = (v0, v1, s0, s1, c, dv, p0, p1, disp)
+        (velFwd, velBack, stateFwd, stateBack) = (vf, vb, sf, sb)
 
         let blank = [Spark](repeating: Spark(), count: Self.sparkCount)
         guard let sparkBuffer = device.makeBuffer(bytes: blank, length: MemoryLayout<Spark>.stride * blank.count),
@@ -104,8 +130,8 @@ final class FireSimulation {
         logs = logBuffer
 
         var kernels: [String: MTLComputePipelineState] = [:]
-        for name in ["clearTexture", "advectVelocity", "advectState", "react", "curl", "applyForces",
-                     "divergence", "jacobi", "project", "updateSparks"] {
+        for name in ["clearTexture", "advectVelocity", "advectState", "advectBack", "macCormack", "react", "curl",
+                     "applyForces", "divergence", "jacobi", "project", "updateSparks"] {
             guard let fn = library.makeFunction(name: name),
                   let pipeline = try? device.makeComputePipelineState(function: fn) else { return nil }
             kernels[name] = pipeline
@@ -121,13 +147,16 @@ final class FireSimulation {
             simTime = time - 4 * Self.dt
             steps = 4
         }
+        // The first call always steps, so that `display` holds something before the first draw.
+        if needsClear { steps = max(steps, 1) }
         if steps > 0 { step(count: steps, commandBuffer: commandBuffer) }
     }
 
     func step(count: Int, commandBuffer: MTLCommandBuffer) {
         guard let enc = commandBuffer.makeComputeCommandEncoder() else { return }
         if needsClear {
-            for t in [velocity, velocityTmp, state, stateTmp, curl, divergence, pressure, pressureTmp] {
+            for t in [velocity, velocityTmp, state, stateTmp, curl, divergence, pressure, pressureTmp,
+                      velFwd, velBack, stateFwd, stateBack, display] {
                 dispatch(enc, "clearTexture", textures: [t])
             }
             needsClear = false
@@ -135,16 +164,23 @@ final class FireSimulation {
         for _ in 0..<count {
             simTime += Self.dt
             frame += 1
+            let sinceStoke = max(0, simTime - stokedAt)
             var u = SimUniforms(size: [Float(size.x), Float(size.y)], dt: Float(Self.dt),
                                 time: Float(simTime.truncatingRemainder(dividingBy: 4000)),
                                 seed: seed.shaderSeed, frame: frame, layoutAspect: layoutAspect,
-                                burst: Float(exp(-max(0, simTime - stokedAt) / 0.8)))
+                                burst: Float(exp(-sinceStoke / 0.8)), boost: boost,
+                                sparkBurst: Float(exp(-sinceStoke / 0.8) + 0.4 * exp(-sinceStoke / 3)))
             enc.setBytes(&u, length: MemoryLayout<SimUniforms>.stride, index: 0)
             enc.setBuffer(logs, offset: 0, index: 1)
 
-            dispatch(enc, "advectVelocity", textures: [velocity, velocityTmp])
-            dispatch(enc, "advectState", textures: [state, velocity, stateTmp])
-            dispatch(enc, "react", textures: [stateTmp, state])
+            // MacCormack advection: forward trace, back trace, then the corrected result.
+            dispatch(enc, "advectVelocity", textures: [velocity, velFwd])
+            dispatch(enc, "advectBack", textures: [velFwd, velocity, velBack])
+            dispatch(enc, "macCormack", textures: [velocity, velFwd, velBack, velocity, velocityTmp])
+            dispatch(enc, "advectState", textures: [state, velocity, stateFwd])
+            dispatch(enc, "advectBack", textures: [stateFwd, velocity, stateBack])
+            dispatch(enc, "macCormack", textures: [state, stateFwd, stateBack, velocity, stateTmp])
+            dispatch(enc, "react", textures: [stateTmp, state, velocityTmp])
             dispatch(enc, "curl", textures: [velocityTmp, curl])
             dispatch(enc, "applyForces", textures: [velocityTmp, state, curl, velocity])
             dispatch(enc, "divergence", textures: [velocity, divergence])
@@ -160,6 +196,7 @@ final class FireSimulation {
             enc.setBytes(&u, length: MemoryLayout<SimUniforms>.stride, index: 1)
             enc.setBuffer(logs, offset: 0, index: 2)
             enc.setTexture(velocity, index: 0)
+            enc.setTexture(state, index: 1)
             enc.dispatchThreadgroups(MTLSize(width: (Self.sparkCount + 31) / 32, height: 1, depth: 1),
                                      threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
         }
@@ -181,15 +218,23 @@ final class FireSimulation {
     }
 }
 
-/// Bakes the room once per size, then draws the simulated fire into it every frame.
+/// Bakes the room once per size, then draws the simulated fire into it every frame:
+/// a low-resolution glow pass blurred at two scales for the bloom, the main pass,
+/// and the sparks on top.
 final class FireRenderer {
     let device: MTLDevice
     let queue: MTLCommandQueue
     let simulation: FireSimulation
     var uniforms: FireUniforms
-    private let scenePipeline, framePipeline, sparkPipeline: MTLRenderPipelineState
+    private let scenePipeline, framePipeline, sparkPipeline, glowPipeline, blurPipeline, sparkGlowPipeline: MTLRenderPipelineState
+    private let fireLightPipeline: MTLComputePipelineState
+    /// How much light each part of the fire gives off, measured once per frame (see `fireLight` in the shader).
+    private let fireLight: MTLBuffer
     private var scene0: MTLTexture?
     private var scene1: MTLTexture?
+    private var scene2: MTLTexture?
+    /// Bloom chain: the emissive parts at 1/8 resolution (glowA/B) and 1/32 (wideA/B).
+    private var glowA, glowB, wideA, wideB: MTLTexture?
 
     init?(layoutAspect: Float, seed: FireSeed) {
         guard let device = FireGPU.device, let library = FireGPU.library, let queue = device.makeCommandQueue(),
@@ -201,16 +246,18 @@ final class FireRenderer {
         uniforms = FireUniforms(layoutAspect: layoutAspect, seed: seed.shaderSeed,
                                 simSize: [Float(sim.size.x), Float(sim.size.y)])
 
-        func pipeline(_ vertex: String, _ fragment: String, _ formats: [MTLPixelFormat], additive: Bool = false) -> MTLRenderPipelineState? {
+        enum Blend { case none, additive, brighter }   // brighter: keeps the brighter of source and destination
+        func pipeline(_ vertex: String, _ fragment: String, _ formats: [MTLPixelFormat], blend: Blend = .none) -> MTLRenderPipelineState? {
             let d = MTLRenderPipelineDescriptor()
             d.vertexFunction = library.makeFunction(name: vertex)
             d.fragmentFunction = library.makeFunction(name: fragment)
             for (i, f) in formats.enumerated() { d.colorAttachments[i].pixelFormat = f }
-            if additive {
+            if blend != .none {
                 let a = d.colorAttachments[0]!
                 a.isBlendingEnabled = true
                 a.sourceRGBBlendFactor = .one
                 a.destinationRGBBlendFactor = .one
+                a.rgbBlendOperation = blend == .additive ? .add : .max
                 a.sourceAlphaBlendFactor = .zero
                 a.destinationAlphaBlendFactor = .one
             }
@@ -219,11 +266,19 @@ final class FireRenderer {
                 return nil
             }
         }
-        guard let scene = pipeline("fullscreenVertex", "sceneFragment", [.rgba16Float, .rgba8Unorm]),
+        guard let scene = pipeline("fullscreenVertex", "sceneFragment", [.rgba8Unorm_srgb, .rgba8Unorm, .rgba8Unorm]),
               let frame = pipeline("fullscreenVertex", "frameFragment", [.bgra8Unorm_srgb]),
-              let spark = pipeline("sparkVertex", "sparkFragment", [.bgra8Unorm_srgb], additive: true)
+              let spark = pipeline("sparkVertex", "sparkFragment", [.bgra8Unorm_srgb], blend: .brighter),
+              let glow = pipeline("fullscreenVertex", "glowFragment", [.rgba16Float]),
+              let blur = pipeline("fullscreenVertex", "blurFragment", [.rgba16Float]),
+              let sparkGlow = pipeline("sparkVertex", "sparkGlowFragment", [.rgba16Float], blend: .additive),
+              let lightFn = library.makeFunction(name: "fireLight"),
+              let light = try? device.makeComputePipelineState(function: lightFn),
+              let lightBuffer = device.makeBuffer(bytes: [FireLight()], length: MemoryLayout<FireLight>.stride, options: .storageModeShared)
         else { return nil }
         (scenePipeline, framePipeline, sparkPipeline) = (scene, frame, spark)
+        (glowPipeline, blurPipeline, sparkGlowPipeline) = (glow, blur, sparkGlow)
+        (fireLightPipeline, fireLight) = (light, lightBuffer)
     }
 
     /// Advances the physics to `time` and draws a frame into `target` (bgra8Unorm_srgb).
@@ -236,18 +291,48 @@ final class FireRenderer {
         uniforms.resolution = [Float(target.width), Float(target.height)]
         uniforms.time = Float(time.truncatingRemainder(dividingBy: 4000))
         bakeSceneIfNeeded(width: target.width, height: target.height, commandBuffer: commandBuffer)
-        guard let scene0, let scene1 else { return }
+        guard let scene0, let scene1, let scene2, let glowA, let glowB, let wideA, let wideB else { return }
 
-        let pass = MTLRenderPassDescriptor()
-        pass.colorAttachments[0].texture = target
-        pass.colorAttachments[0].loadAction = .dontCare
-        pass.colorAttachments[0].storeAction = .store
-        guard let enc = commandBuffer.makeRenderCommandEncoder(descriptor: pass) else { return }
+        // How much light each part of the fire gives off this frame, for the room light.
+        guard let lightEnc = commandBuffer.makeComputeCommandEncoder() else { return }
+        lightEnc.setComputePipelineState(fireLightPipeline)
+        lightEnc.setTexture(simulation.display, index: 0)
+        lightEnc.setBuffer(fireLight, offset: 0, index: 0)
+        lightEnc.setBytes(&uniforms, length: MemoryLayout<FireUniforms>.stride, index: 1)
+        lightEnc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 512, height: 1, depth: 1))
+        lightEnc.endEncoding()
+
+        // Bloom: the emissive parts alone at an eighth of the resolution, sparks
+        // included, blurred to a 16 px halo, then again at a 32nd for a 64 px one.
+        var glowUniforms = uniforms
+        glowUniforms.resolution = [Float(glowA.width), Float(glowA.height)]
+        guard let glowEnc = renderPass(to: glowA, commandBuffer: commandBuffer) else { return }
+        glowEnc.setRenderPipelineState(glowPipeline)
+        glowEnc.setFragmentBytes(&glowUniforms, length: MemoryLayout<FireUniforms>.stride, index: 0)
+        glowEnc.setFragmentBuffer(fireLight, offset: 0, index: 1)
+        glowEnc.setFragmentTexture(scene1, index: 1)
+        glowEnc.setFragmentTexture(simulation.display, index: 2)
+        glowEnc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+        glowEnc.setRenderPipelineState(sparkGlowPipeline)
+        glowEnc.setVertexBuffer(simulation.sparks, offset: 0, index: 0)
+        glowEnc.setVertexBytes(&glowUniforms, length: MemoryLayout<FireUniforms>.stride, index: 1)
+        glowEnc.drawPrimitives(type: .point, vertexStart: 0, vertexCount: FireSimulation.sparkCount)
+        glowEnc.endEncoding()
+        blur(from: glowA, to: glowB, dir: [1, 0], commandBuffer: commandBuffer)
+        blur(from: glowB, to: glowA, dir: [0, 1], commandBuffer: commandBuffer)
+        blur(from: glowA, to: wideA, dir: [4, 0], commandBuffer: commandBuffer)   // taps a wide texel apart: downsamples as it blurs
+        blur(from: wideA, to: wideB, dir: [0, 1], commandBuffer: commandBuffer)
+
+        guard let enc = renderPass(to: target, commandBuffer: commandBuffer) else { return }
         enc.setRenderPipelineState(framePipeline)
         enc.setFragmentBytes(&uniforms, length: MemoryLayout<FireUniforms>.stride, index: 0)
+        enc.setFragmentBuffer(fireLight, offset: 0, index: 1)
         enc.setFragmentTexture(scene0, index: 0)
         enc.setFragmentTexture(scene1, index: 1)
         enc.setFragmentTexture(simulation.display, index: 2)
+        enc.setFragmentTexture(scene2, index: 3)
+        enc.setFragmentTexture(glowA, index: 4)
+        enc.setFragmentTexture(wideB, index: 5)
         enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
 
         enc.setRenderPipelineState(sparkPipeline)
@@ -257,17 +342,41 @@ final class FireRenderer {
         enc.endEncoding()
     }
 
+    private func renderPass(to target: MTLTexture, commandBuffer: MTLCommandBuffer) -> MTLRenderCommandEncoder? {
+        let pass = MTLRenderPassDescriptor()
+        pass.colorAttachments[0].texture = target
+        pass.colorAttachments[0].loadAction = .dontCare
+        pass.colorAttachments[0].storeAction = .store
+        return commandBuffer.makeRenderCommandEncoder(descriptor: pass)
+    }
+
+    /// One direction of the separable Gaussian, `dir` in source texels.
+    private func blur(from src: MTLTexture, to dst: MTLTexture, dir: SIMD2<Float>, commandBuffer: MTLCommandBuffer) {
+        guard let enc = renderPass(to: dst, commandBuffer: commandBuffer) else { return }
+        var params = BlurParams(dir: dir, targetSize: [Float(dst.width), Float(dst.height)])
+        enc.setRenderPipelineState(blurPipeline)
+        enc.setFragmentBytes(&params, length: MemoryLayout<BlurParams>.stride, index: 0)
+        enc.setFragmentTexture(src, index: 0)
+        enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+        enc.endEncoding()
+    }
+
     private func bakeSceneIfNeeded(width: Int, height: Int, commandBuffer: MTLCommandBuffer) {
         if let scene0, scene0.width == width, scene0.height == height { return }
-        func texture(_ format: MTLPixelFormat) -> MTLTexture? {
-            let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: format, width: width, height: height, mipmapped: false)
+        func texture(_ format: MTLPixelFormat, _ w: Int = width, _ h: Int = height) -> MTLTexture? {
+            let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: format, width: w, height: h, mipmapped: false)
             d.usage = [.renderTarget, .shaderRead]
             d.storageMode = .private
             return device.makeTexture(descriptor: d)
         }
-        guard let t0 = texture(.rgba16Float), let t1 = texture(.rgba8Unorm) else { return }
+        let gw = max(1, width / 8), gh = max(1, height / 8), ww = max(1, width / 32), wh = max(1, height / 32)
+        guard let t0 = texture(.rgba8Unorm_srgb), let t1 = texture(.rgba8Unorm), let t2 = texture(.rgba8Unorm),
+              let gA = texture(.rgba16Float, gw, gh), let gB = texture(.rgba16Float, gw, gh),
+              let wA = texture(.rgba16Float, ww, wh), let wB = texture(.rgba16Float, ww, wh)
+        else { return }
+        (glowA, glowB, wideA, wideB) = (gA, gB, wA, wB)
         let pass = MTLRenderPassDescriptor()
-        for (i, t) in [t0, t1].enumerated() {
+        for (i, t) in [t0, t1, t2].enumerated() {
             pass.colorAttachments[i].texture = t
             pass.colorAttachments[i].loadAction = .dontCare
             pass.colorAttachments[i].storeAction = .store
@@ -280,6 +389,7 @@ final class FireRenderer {
         enc.endEncoding()
         scene0 = t0
         scene1 = t1
+        scene2 = t2
     }
 
     /// Lets the fire burn for `warmUp` seconds of simulated time, then captures a still.

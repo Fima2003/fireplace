@@ -59,6 +59,15 @@ final class ClapAnalyzer {
     private var mutedUntil: Double = 0
     private var previousRMS: Float = 0
 
+    /// Seconds of audio processed so far; event times are on this clock.
+    var elapsed: Double { Double(samplesSeen) / sampleRate }
+
+    /// The onset of a first clap still waiting for its partner, if one could yet arrive.
+    var pendingClapTime: Double? {
+        guard let first = pendingClap, elapsed - first.time <= settings.maxGap else { return nil }
+        return first.time
+    }
+
     init(sampleRate: Double, settings: ClapSettings) {
         self.settings = settings
         self.sampleRate = sampleRate
@@ -75,7 +84,14 @@ final class ClapAnalyzer {
         background = settings.minLevel / 4
     }
 
-    func process(_ samples: UnsafePointer<Float>, count: Int, emit: (Event) -> Void) {
+    /// Ignores onsets for the next `seconds` of audio; the background level still adapts.
+    func mute(for seconds: Double) {
+        mutedUntil = max(mutedUntil, elapsed + seconds)
+    }
+
+    /// Feeds `count` samples. `veto` is asked about each clap's onset time before it
+    /// counts; a vetoed clap is neither reported nor taken as half of a double clap.
+    func process(_ samples: UnsafePointer<Float>, count: Int, veto: ((Double) -> Bool)? = nil, emit: (Event) -> Void) {
         for i in 0..<count {
             let x = samples[i]
             let y = hpCoeff * (prevY + x - prevX)
@@ -86,7 +102,7 @@ final class ClapAnalyzer {
             if chunkCount == chunkSize {
                 let rms = (chunkSumSq / Float(chunkSize)).squareRoot()
                 let time = Double(samplesSeen + Int64(i)) / sampleRate
-                step(rms: rms, time: time, emit: emit)
+                step(rms: rms, time: time, veto: veto, emit: emit)
                 chunkSumSq = 0
                 chunkCount = 0
             }
@@ -94,7 +110,7 @@ final class ClapAnalyzer {
         samplesSeen += Int64(count)
     }
 
-    private func step(rms: Float, time: Double, emit: (Event) -> Void) {
+    private func step(rms: Float, time: Double, veto: ((Double) -> Bool)?, emit: (Event) -> Void) {
         defer { previousRMS = rms }
         switch state {
         case .idle:
@@ -123,7 +139,9 @@ final class ClapAnalyzer {
                 state = .idle
                 // Don't let the clap's own echo count as the next one.
                 mutedUntil = max(mutedUntil, time + 0.06)
-                registerClap(at: start, level: peak, duration: time - start, emit: emit)
+                if veto?(start) != true {
+                    registerClap(at: start, level: peak, duration: time - start, emit: emit)
+                }
             } else {
                 state = .rising(start: start, peak: peak, peakTime: peakTime)
             }
@@ -162,20 +180,45 @@ final class ClapAnalyzer {
 /// Event driven end to end: Core Audio hands each captured buffer to the tap
 /// block, the analyzer runs over it, and only a detected double clap wakes the
 /// main thread. There are no timers or polling loops anywhere.
+///
+/// While the fire is lit the fire sound plays on this same engine, because our
+/// own crackles through the speakers look just like claps to the microphone.
+/// Voice processing on the input node then cancels what we play (mode `.echoCancelled`).
+/// If it can't be enabled, every crackle is stamped with the host time it left the
+/// speaker and claps that land within [-20 ms, +60 ms] of one are dropped
+/// (mode `.timeRejected`).
+///
+/// An engine with voice processing takes close to two seconds to come up, so
+/// engines are built on a queue of their own and published on the main thread
+/// once they run: the fire can appear the moment the clap is heard. Builds run
+/// one at a time, and a `stop()` or a newer request makes the one in flight
+/// moot; its engine is stopped as soon as it comes up.
 final class ClapDetector {
+    enum Mode {
+        case inputOnly, echoCancelled, timeRejected
+    }
+
     var onClap: ((Float) -> Void)?
     var onDoubleClap: (() -> Void)?
+    /// Called on the main queue when a lit engine (or its replacement after a device
+    /// change) is running, with `nil` when none could be started at all.
+    var onModeChange: ((Mode?) -> Void)?
+    private(set) var mode: Mode?
+    /// RMS of the raw microphone input over the last second or so.
+    private(set) var inputRMS: Float = 0
 
     private let settings: ClapSettings
-    private let engine = AVAudioEngine()
+    private var engine: AVAudioEngine?
+    private var sound: FireSound?
+    private var wantsEchoCancellation = true
     private var configObserver: NSObjectProtocol?
-    private var ignoreUntil = Date.distantPast
 
-    /// Ignores claps for a while, e.g. while our own crackling sound is playing:
-    /// a crackle through the speakers looks just like a clap to the microphone.
-    func ignore(for seconds: TimeInterval) {
-        ignoreUntil = max(ignoreUntil, Date().addingTimeInterval(seconds))
-    }
+    /// Engines are built and old ones stopped here, in order, off the main thread.
+    private let buildQueue = DispatchQueue(label: "com.fima.Fireplace.ClapDetector", qos: .userInitiated)
+    /// Bumped by every start and stop; a build or a tap buffer from an older
+    /// generation is thrown away. Written on the main thread, read on the others.
+    private var generation = 0
+    private let generationLock = NSLock()
 
     init(settings: ClapSettings = .fromDefaults()) {
         self.settings = settings
@@ -185,40 +228,230 @@ final class ClapDetector {
         var errorDescription: String? { "No microphone input is available." }
     }
 
+    /// Microphone only, no voice processing: the mic path stays untouched and nothing is
+    /// ducked. Quick (well under a second), so it waits for the engine before returning.
     func start() throws {
+        sound = nil
+        let (old, gen) = retire()
+        let started = DispatchTime.now()
+        let built = try buildQueue.sync { () -> Built in
+            Self.shutDown(old)
+            return try build(cancelling: false, sound: nil, generation: gen)
+        }
+        publish(built, generation: gen, builtIn: Self.millisecondsSince(started))
+    }
+
+    /// Microphone plus the fire sound on one engine: echo cancellation if it can be had,
+    /// time-based rejection if not, and the microphone alone if the sound can't start at all.
+    /// Returns at once; `onModeChange` reports the engine that came up.
+    func start(with sound: FireSound, echoCancellation: Bool = true) {
+        self.sound = sound
+        wantsEchoCancellation = echoCancellation
+        rebuild()
+    }
+
+    /// Takes the engine out of service now; it is stopped and released on the build
+    /// queue (letting go of a voice-processing engine costs a quarter of a second). A
+    /// build still in flight stops its own engine when it is done; `completion` runs
+    /// on the main queue once nothing of ours is left running.
+    func stop(completion: (() -> Void)? = nil) {
+        let (old, _) = retire()
+        buildQueue.async {
+            Self.shutDown(old)
+            if let completion { DispatchQueue.main.async(execute: completion) }
+        }
+    }
+
+    // MARK: - Building engines
+
+    private struct Built {
+        let engine: AVAudioEngine
+        let mode: Mode
+        let format: AVAudioFormat
+        let inputLatency: Double
+    }
+
+    /// Takes the current engine out of service (the caller stops it) and starts a new
+    /// generation, so whatever is still being built for the old one is discarded.
+    private func retire() -> (engine: AVAudioEngine?, generation: Int) {
+        if let configObserver { NotificationCenter.default.removeObserver(configObserver) }
+        configObserver = nil
+        let old = engine
+        engine = nil
+        mode = nil
+        generationLock.lock()
+        generation += 1
+        let gen = generation
+        generationLock.unlock()
+        return (old, gen)
+    }
+
+    private func isCurrent(_ gen: Int) -> Bool {
+        generationLock.lock()
+        defer { generationLock.unlock() }
+        return generation == gen
+    }
+
+    private static func shutDown(_ engine: AVAudioEngine?) {
+        engine?.inputNode.removeTap(onBus: 0)
+        engine?.stop()
+    }
+
+    private static func millisecondsSince(_ t: DispatchTime) -> Double {
+        Double(DispatchTime.now().uptimeNanoseconds - t.uptimeNanoseconds) / 1e6
+    }
+
+    /// Retires the current engine and builds its replacement on the build queue:
+    /// the lit chain when there is a sound to play, the plain microphone otherwise.
+    private func rebuild() {
+        let (old, gen) = retire()
+        let sound = self.sound
+        let wantsAEC = wantsEchoCancellation
+        buildQueue.async { [weak self] in
+            Self.shutDown(old)
+            guard let self, self.isCurrent(gen) else { return }
+            let started = DispatchTime.now()
+            var built: Built?
+            do {
+                built = try sound.map { try self.buildLit(sound: $0, cancelling: wantsAEC, generation: gen) }
+                    ?? self.build(cancelling: false, sound: nil, generation: gen)
+            } catch {
+                log("Could not start the microphone: \(error.localizedDescription)")
+            }
+            let ms = Self.millisecondsSince(started)
+            // Superseded while building (a stop, or another device change): nobody wants this one.
+            guard self.isCurrent(gen) else { return Self.shutDown(built?.engine) }
+            DispatchQueue.main.async {
+                // Releasing a voice-processing engine takes a quarter second: not on this thread.
+                guard self.isCurrent(gen) else { return self.buildQueue.async { Self.shutDown(built?.engine) } }
+                if let built { self.publish(built, generation: gen, builtIn: ms) }
+                self.onModeChange?(built?.mode)
+            }
+        }
+    }
+
+    /// The lit engine, trying the ways of hearing claps through our own sound in turn.
+    private func buildLit(sound: FireSound, cancelling wantsAEC: Bool, generation gen: Int) throws -> Built {
+        if wantsAEC {
+            do { return try build(cancelling: true, sound: sound, generation: gen) } catch {
+                log("Echo cancellation unavailable (\(error.localizedDescription)); rejecting our own crackles by time instead.")
+            }
+        }
+        do { return try build(cancelling: false, sound: sound, generation: gen) } catch {
+            log("Could not play the fire sound with the microphone (\(error.localizedDescription)); listening without it.")
+        }
+        return try build(cancelling: false, sound: nil, generation: gen)
+    }
+
+    /// Builds and starts one engine. Runs on the build queue, so it reads nothing of
+    /// `self` that the main thread writes; what it needs comes in as arguments.
+    private func build(cancelling: Bool, sound: FireSound?, generation gen: Int) throws -> Built {
+        // Voice processing reconfigures the input node, so each mode gets a fresh engine.
+        let engine = AVAudioEngine()
         let input = engine.inputNode
+        if cancelling {
+            try input.setVoiceProcessingEnabled(true)
+            input.isVoiceProcessingAGCEnabled = false
+            if #available(macOS 14, *) {
+                // Turn other apps down as little as voice processing allows.
+                input.voiceProcessingOtherAudioDuckingConfiguration =
+                    AVAudioVoiceProcessingOtherAudioDuckingConfiguration(enableAdvancedDucking: false, duckingLevel: .min)
+            }
+        }
         let format = input.outputFormat(forBus: 0)
         guard format.sampleRate > 0, format.channelCount > 0 else { throw NoInputError() }
 
         let analyzer = ClapAnalyzer(sampleRate: format.sampleRate, settings: settings)
-        input.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
-            guard let channel = buffer.floatChannelData?[0] else { return }
-            analyzer.process(channel, count: Int(buffer.frameLength)) { event in
-                DispatchQueue.main.async { self?.deliver(event) }
+        if sound != nil {
+            // A fresh analyzer has forgotten the double clap that lit the fire, and with echo
+            // cancellation the canceller takes a few seconds to converge on our sound: what
+            // gets through meanwhile must not put the fire straight out again. (The fallback
+            // gets the same 3 s for the first reason alone.)
+            analyzer.mute(for: 3)
+        }
+        // Without echo cancellation, our crackles are told apart from claps by when they happened.
+        let rejectOurs = cancelling ? nil : sound
+        sound?.synth.tickRate = cancelling ? 3 : 1.5
+        // The tap's buffers carry the host time they left the input device; the sound
+        // reached the microphone that much earlier. (Taken as fixed for the life of the
+        // engine, and assumed to be what the stamp leaves out; on a Bluetooth
+        // microphone it is tens of milliseconds.)
+        let inputLatency = input.presentationLatency
+        input.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, when in
+            guard let self, let channel = buffer.floatChannelData?[0] else { return }
+            let count = Int(buffer.frameLength)
+            var sumSq: Float = 0
+            for i in 0..<count { sumSq += channel[i] * channel[i] }
+            inputRMS += ((sumSq / Float(max(1, count))).squareRoot() - inputRMS) * 0.05
+            // Where this buffer sits on the host clock, to date each clap against our crackles.
+            let hostStart = (when.isHostTimeValid
+                ? AVAudioTime.seconds(forHostTime: when.hostTime)
+                : AVAudioTime.seconds(forHostTime: mach_absolute_time()) - Double(count) / format.sampleRate)
+                - inputLatency
+            let analyzerStart = analyzer.elapsed
+            let veto: ((Double) -> Bool)? = rejectOurs.map { sound in
+                { onset in sound.recentCrackle(near: hostStart + (onset - analyzerStart)) }
+            }
+            analyzer.process(channel, count: count, veto: veto) { event in
+                DispatchQueue.main.async { self.deliver(event, from: gen) }
+            }
+            // While a first clap waits for its partner, hold our crackles back so they can't
+            // veto the second one (a second's pause in the crackling goes unnoticed).
+            if let sound = rejectOurs, let first = analyzer.pendingClapTime {
+                sound.synth.holdCracklesUntil = hostStart + (first - analyzerStart) + self.settings.maxGap + 0.1
             }
         }
+
+        if let sound {
+            // Mono at the engine's rate; with voice processing in and out must share a format.
+            let rate = cancelling ? format.sampleRate : engine.outputNode.outputFormat(forBus: 0).sampleRate
+            guard let mono = AVAudioFormat(standardFormatWithSampleRate: rate, channels: 1) else { throw NoInputError() }
+            let node = sound.makeSourceNode(format: mono)
+            engine.attach(node)
+            engine.connect(node, to: engine.mainMixerNode, format: mono)
+            engine.connect(engine.mainMixerNode, to: engine.outputNode, format: mono)
+        }
+
         engine.prepare()
         try engine.start()
+        sound?.synth.outputLatency = engine.outputNode.presentationLatency
+        let mode: Mode = sound == nil ? .inputOnly : cancelling ? .echoCancelled : .timeRejected
+        return Built(engine: engine, mode: mode, format: format, inputLatency: inputLatency)
+    }
 
-        // Rebuild the tap if the input device or its format changes (e.g. AirPods connect).
+    /// Makes a freshly started engine the current one. Main thread.
+    private func publish(_ built: Built, generation gen: Int, builtIn ms: Double) {
+        let engine = built.engine
+        self.engine = engine
+        mode = built.mode
+        let format = built.format
+        switch built.mode {
+        case .inputOnly:
+            // Lit and here: the sound could not start, so it stays off until the next light.
+            if sound != nil { sound = nil }
+            log(String(format: "Listening on the microphone (%.0f Hz, %d ch; up in %.0f ms).",
+                       format.sampleRate, format.channelCount, ms))
+        case .echoCancelled:
+            log(String(format: "Microphone and fire sound on one engine; voice processing cancels our own sound (mode: AEC, %.0f Hz, %d ch; up in %.0f ms off the main thread).",
+                       format.sampleRate, format.channelCount, ms))
+        case .timeRejected:
+            wantsEchoCancellation = false
+            log(String(format: "Microphone and fire sound without echo cancellation; dropping claps that coincide with our crackles (mode: fallback, %.0f Hz, %d ch, input latency %.1f ms; up in %.0f ms off the main thread).",
+                       format.sampleRate, format.channelCount, built.inputLatency * 1000, ms))
+        }
+
+        // Rebuild if the input or output device changes (e.g. AirPods connect).
         configObserver = NotificationCenter.default.addObserver(
             forName: .AVAudioEngineConfigurationChange, object: engine, queue: .main
         ) { [weak self] _ in
-            guard let self else { return }
-            self.stop()
-            do { try self.start() } catch { log("Could not restart microphone: \(error.localizedDescription)") }
+            guard let self, self.engine === engine else { return }
+            log("Audio device changed; rebuilding.")
+            self.rebuild()
         }
     }
 
-    func stop() {
-        if let configObserver { NotificationCenter.default.removeObserver(configObserver) }
-        configObserver = nil
-        engine.inputNode.removeTap(onBus: 0)
-        engine.stop()
-    }
-
-    private func deliver(_ event: ClapAnalyzer.Event) {
-        guard Date() >= ignoreUntil else { return }
+    private func deliver(_ event: ClapAnalyzer.Event, from gen: Int) {
+        guard isCurrent(gen) else { return }
         switch event {
         case let .clap(_, level, _): onClap?(level)
         case .doubleClap: onDoubleClap?()

@@ -30,4 +30,7 @@ final class FireplaceView: MTKView, MTKViewDelegate {
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
 
     func stoke() { renderer.simulation.stoke() }
+
+    /// 0 to 1: how hard the coil is driving the fire right now.
+    func setBoost(_ boost: Float) { renderer.simulation.boost = boost }
 }
